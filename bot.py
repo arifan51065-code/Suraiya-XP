@@ -7,11 +7,14 @@ import requests
 
 # ------------ ENV ------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+HF_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 ALLOWED_CHANNEL_ID = os.getenv("ALLOWED_CHANNEL_ID")
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN missing")
+if not HF_API_KEY:
+    raise RuntimeError("HUGGINGFACE_API_KEY missing")
 
 if ALLOWED_CHANNEL_ID:
     try:
@@ -19,25 +22,16 @@ if ALLOWED_CHANNEL_ID:
     except ValueError:
         ALLOWED_CHANNEL_ID = None
 
-# ------------ KOBOLDAI HORDE CONFIG ------------
-# Public free Horde text endpoint
-HORDE_URL = "https://horde.koboldai.net/api/v2/generate/text/async"
-HORDE_CHECK_URL = "https://horde.koboldai.net/api/v2/generate/text/status/"
-
-# Horde requires a "client_agent" string to identify your app
-CLIENT_AGENT = "suraiya_discord_bot/1.0"
-
-# Model name: pick a common uncensored instruct model
-# You can change later if needed (e.g. "PygmalionAI/pygmalion-2-7b", etc.)
-HORDE_MODEL = "koboldcpp/llama-3.1-8b-instruct"
-
+# ------------ HUGGINGFACE MODEL CONFIG ------------
+# Safe, instruct model (real AI, free)
+HF_MODEL = "microsoft/Phi-3-mini-4k-instruct"
+HF_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
 
 # ------------ DISCORD SETUP ------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 client = discord.Client(intents=intents)
-
 
 # ------------ Suraiya Personality ------------
 SYSTEM_PROMPT = """
@@ -66,114 +60,82 @@ Example tones:
 - Angry: "abe pagol, arekta gali dile phone rakhe dicchi! 😤"
 """
 
-def build_prompt(user_name: str, user_message: str) -> str:
-    """
-    Build a single text prompt for instruct-style models.
-    Horde models typically work well with simple instruction-style text.
-    """
+def build_prompt(user_name: str, user_text: str) -> str:
     return (
         f"{SYSTEM_PROMPT}\n\n"
         f"User name: {user_name}\n"
-        f"User message: {user_message}\n\n"
-        "Suraiya hisebe Bangla romantic style e reply dao."
+        f"User message: {user_text}\n\n"
+        "Suraiya hisebe Bangla romantic, sweet, flirty style e reply dao."
     )
 
+# ------------ HF CALL (SYNC) ------------
 
-# ------------ HORDE API CALLS ------------
+def hf_reply_sync(user_name: str, user_text: str) -> str:
+    prompt = build_prompt(user_name, user_text)
 
-def horde_generate_sync(prompt: str) -> str:
-    """
-    1) Send generation request to Horde (async job)
-    2) Poll until finished
-    3) Return generated text
-    """
-    # Step 1: submit job
     headers = {
-        "Client-Agent": CLIENT_AGENT,
+        "Authorization": f"Bearer {HF_API_KEY}",
         "Content-Type": "application/json",
     }
 
     payload = {
-        "prompt": prompt,
-        "params": {
-            "n": 1,
-            "max_context_length": 2048,
-            "max_length": 160,
-            "temperature": 0.8,
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 180,
+            "temperature": 0.9,
             "top_p": 0.9,
-        },
-        "models": [HORDE_MODEL],
+        }
     }
 
     try:
-        resp = requests.post(HORDE_URL, headers=headers, json=payload, timeout=30)
+        resp = requests.post(HF_URL, headers=headers, json=payload, timeout=60)
     except Exception as e:
-        print("❌ Horde HTTP error (submit):", repr(e))
+        print("❌ HF HTTP error:", repr(e))
         return "Baby, amar matha ektu ghurchhe… abar kichu khon pore try korba? 🥺"
 
-    if resp.status_code != 202:
-        print("❌ Horde submit non-202:", resp.status_code, resp.text[:400])
-        return "Baby, ajke server gula ektu ullu patha korche… abar pore try korbo? 🥺"
+    print("🔎 HF status:", resp.status_code)
 
-    data = resp.json()
-    # job ID
-    job_id = data.get("id")
-    if not job_id:
-        print("❌ Horde no job id:", data)
-        return "Baby, amar kotha gulo network e hariye jacche… abar likho na? 🥺"
+    if resp.status_code != 200:
+        print("❌ HF non-200:", resp.text[:400])
+        return "Baby, ajke amar network ta ektu off lagche… abar pore try korbo, thik ache? 🥺"
 
-    print(f"🟣 Horde job submitted: {job_id}")
+    try:
+        data = resp.json()
+    except Exception as e:
+        print("❌ HF JSON error:", repr(e), "body:", resp.text[:400])
+        return "Baby, amar kotha gulo mix hoye jacche… abar ekbar likho to jaan? 🥺"
 
-    # Step 2: poll for result
-    status_url = HORDE_CHECK_URL + job_id
+    print("🟣 HF raw:", json.dumps(data)[:300])
 
-    for i in range(30):  # up to ~30 polls
-        try:
-            st = requests.get(status_url, headers=headers, timeout=20)
-        except Exception as e:
-            print("❌ Horde HTTP error (status):", repr(e))
-            break
+    # Normal text-generation format: list with "generated_text"
+    try:
+        if isinstance(data, list) and "generated_text" in data[0]:
+            full = data[0]["generated_text"]
+            # generated_text = prompt + completion → promptটা কেটে ফেলি
+            generated = full[len(prompt):].strip()
+            return generated or full.strip()
 
-        if st.status_code != 200:
-            print("❌ Horde status non-200:", st.status_code, st.text[:400])
-            break
+        # Some pipelines may directly return text
+        if isinstance(data, dict) and "generated_text" in data:
+            return data["generated_text"].strip()
 
-        st_data = st.json()
-        # When done, "done" is True and "generations" has content
-        if st_data.get("done"):
-            gens = st_data.get("generations") or []
-            if gens:
-                text = gens[0].get("text", "").strip()
-                print("✅ Horde generation received.")
-                return text or "Baby, amar kotha gulo ektu confuse hoye gelo… abar likho? 🥺"
-            else:
-                print("❌ Horde generations empty:", st_data)
-                break
+        # Fallback: stringify
+        return str(data)
+    except Exception as e:
+        print("❌ HF shape error:", repr(e))
+        return "Baby, amar reply ta vulvule hoye gelo… abar ekbar bolo, please? 🥺"
 
-        # Not done yet → wait a bit
-        asyncio.sleep(0.0)  # no-op for sync
-        import time
-        time.sleep(2)
-
-    # If still not returned:
-    print("❌ Horde generation timeout.")
-    return "Baby, onek deri hoye jacche… amar connection ektu slow mone hocche… abar try korbo? 🥺"
-
-
-async def horde_generate(prompt: str) -> str:
-    # run blocking HTTP logic in a separate thread
-    return await asyncio.to_thread(horde_generate_sync, prompt)
-
+async def hf_reply(user_name: str, user_text: str) -> str:
+    return await asyncio.to_thread(hf_reply_sync, user_name, user_text)
 
 # ------------ DISCORD EVENTS ------------
 
 @client.event
 async def on_ready():
-    print(f"✅ Suraiya (Horde) online as {client.user} (ID: {client.user.id})")
+    print(f"✅ Suraiya (HF AI) online as {client.user} (ID: {client.user.id})")
 
 @client.event
 async def on_message(message: discord.Message):
-    # ignore other bots
     if message.author.bot:
         return
 
@@ -183,7 +145,7 @@ async def on_message(message: discord.Message):
 
     is_dm = isinstance(message.channel, discord.DMChannel)
 
-    # optional: limit to one channel in servers
+    # optional channel restriction
     if not is_dm and ALLOWED_CHANNEL_ID:
         if message.channel.id != ALLOWED_CHANNEL_ID:
             return
@@ -191,24 +153,20 @@ async def on_message(message: discord.Message):
     user_name = message.author.display_name
     print(f"💬 EVENT from {user_name} in {message.channel}: {content!r}")
 
-    prompt = build_prompt(user_name, content)
+    reply = await hf_reply(user_name, content)
 
-    reply_text = await horde_generate(prompt)
-
-    # ensure not too long
-    if len(reply_text) > 1900:
-        reply_text = reply_text[:1900]
+    if len(reply) > 1900:
+        reply = reply[:1900]
 
     try:
-        await message.channel.send(reply_text)
+        await message.channel.send(reply)
     except Exception as e:
         print("❌ Discord send error:", repr(e))
-
 
 # ------------ KEEP-ALIVE WEB SERVER ------------
 
 async def handle_root(request):
-    return web.Response(text="Suraiya (KoboldAI Horde) is alive 💖")
+    return web.Response(text="Suraiya (HuggingFace AI) is alive 💖")
 
 async def start_web():
     app = web.Application()
@@ -220,7 +178,6 @@ async def start_web():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     print(f"🌐 Web server running on port {PORT}")
-
 
 # ------------ MAIN ------------
 
