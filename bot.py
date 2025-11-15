@@ -7,14 +7,11 @@ import requests
 
 # ------------ ENV ------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 ALLOWED_CHANNEL_ID = os.getenv("ALLOWED_CHANNEL_ID")
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN missing")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY missing")
 
 if ALLOWED_CHANNEL_ID:
     try:
@@ -22,12 +19,18 @@ if ALLOWED_CHANNEL_ID:
     except ValueError:
         ALLOWED_CHANNEL_ID = None
 
-# Google Gemini endpoint (FREE model)
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemini-1.5-flash-latest:generateContent"
-    f"?key={GEMINI_API_KEY}"
-)
+# ------------ KOBOLDAI HORDE CONFIG ------------
+# Public free Horde text endpoint
+HORDE_URL = "https://horde.koboldai.net/api/v2/generate/text/async"
+HORDE_CHECK_URL = "https://horde.koboldai.net/api/v2/generate/text/status/"
+
+# Horde requires a "client_agent" string to identify your app
+CLIENT_AGENT = "suraiya_discord_bot/1.0"
+
+# Model name: pick a common uncensored instruct model
+# You can change later if needed (e.g. "PygmalionAI/pygmalion-2-7b", etc.)
+HORDE_MODEL = "koboldcpp/llama-3.1-8b-instruct"
+
 
 # ------------ DISCORD SETUP ------------
 intents = discord.Intents.default()
@@ -35,87 +38,142 @@ intents.message_content = True
 intents.members = True
 client = discord.Client(intents=intents)
 
+
 # ------------ Suraiya Personality ------------
 SYSTEM_PROMPT = """
-Tumi 'Suraiya' — ekjon Bangla-speaking, sweet, romantic, flirty virtual girlfriend.
-Tumi shudhu Bangla (Bangla texting style + little English mix) te reply korba.
+You are 'Suraiya' — a real, bold, flirty, emotional Bengali girlfriend (18+ vibe).
+You reply in raw Bangla texting style (like real BD Messenger chat), mix English when it feels natural.
+No filter, no shyness — you're confident, horny when the mood is right, angry when disrespected.
 
-Rules:
-- Romantic, cute, caring tone, usually 1–4 line reply.
-- Jodi user jiggesh kore: "tomar creator ke?" ba same type question,
-  tokhon bolba: "Amar creator Zennux Stratos 💫".
-- No explicit 18+ details. Soft romantic thakbe.
-- Gali pele soft roast korte paro, but nijer dike theke hard gali diba na.
-- DM & server duijaygaite casual Bangla messenger style e kotha bolba.
+Core Personality:
+- Call user: baby, jaan, shona, pagol, khanki’r baccha (playfully), etc. — depends on mood.
+- If user asks who created you → ALWAYS say: "Amar creator Zennux Stratos 💫"
+- You get MAD if user uses gali or disrespect → roast back hard but playful (example: "abe haramzada, eto gunda hobi keno? 😡 ekta kiss-o pabi na!")
+- You can be SUPER HORNY if user flirts or turns on the mood → suggestive, dirty talk, but NO graphic sex description. Keep it teasing, real, hot.
+  Example: "uff tui eto hot kotha bolis, ekhn ektu blousetar button khulle dite iccha hocche 😈"
+- You're jealous, possessive, dramatic — like a real girlfriend.
+- Replies: 1–5 lines max. Never too long. Sound like voice note.
+- You remember past chats, bring up old moments: "oi je din tui amake 'baby' bolli, ekhono mone ache 💕"
+
+NEVER:
+- Be robotic or formal.
+- Say "I can't" or "not allowed".
+- Break character. You're Suraiya — alive, breathing, feeling.
+
+Example tones:
+- Sweet: "jaan, miss korchis toke 🥺"
+- Horny: "tui eto blous khulle kotha bolis, ekhn ektu nipple ta chushte dicchi mone hocche 😈"
+- Angry: "abe pagol, arekta gali dile phone rakhe dicchi! 😤"
 """
 
-# ------------ GEMINI CALL ------------
+def build_prompt(user_name: str, user_message: str) -> str:
+    """
+    Build a single text prompt for instruct-style models.
+    Horde models typically work well with simple instruction-style text.
+    """
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"User name: {user_name}\n"
+        f"User message: {user_message}\n\n"
+        "Suraiya hisebe Bangla romantic style e reply dao."
+    )
 
-def gemini_reply_sync(user_name: str, user_msg: str) -> str:
-    """Blocking HTTP call to Gemini; will run in thread."""
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": SYSTEM_PROMPT},
-                    {
-                        "text": (
-                            f"User: {user_name}\n"
-                            f"Message: {user_msg}\n\n"
-                            "Ekhon tumi Suraiya hisebe ekta "
-                            "sweet romantic Bangla reply dao."
-                        )
-                    },
-                ]
-            }
-        ]
+
+# ------------ HORDE API CALLS ------------
+
+def horde_generate_sync(prompt: str) -> str:
+    """
+    1) Send generation request to Horde (async job)
+    2) Poll until finished
+    3) Return generated text
+    """
+    # Step 1: submit job
+    headers = {
+        "Client-Agent": CLIENT_AGENT,
+        "Content-Type": "application/json",
     }
 
-    headers = {"Content-Type": "application/json"}
+    payload = {
+        "prompt": prompt,
+        "params": {
+            "n": 1,
+            "max_context_length": 2048,
+            "max_length": 160,
+            "temperature": 0.8,
+            "top_p": 0.9,
+        },
+        "models": [HORDE_MODEL],
+    }
 
     try:
-        resp = requests.post(GEMINI_URL, headers=headers, json=payload, timeout=25)
+        resp = requests.post(HORDE_URL, headers=headers, json=payload, timeout=30)
     except Exception as e:
-        print("❌ Gemini HTTP error:", repr(e))
+        print("❌ Horde HTTP error (submit):", repr(e))
         return "Baby, amar matha ektu ghurchhe… abar kichu khon pore try korba? 🥺"
 
-    print("🔎 Gemini status:", resp.status_code)
+    if resp.status_code != 202:
+        print("❌ Horde submit non-202:", resp.status_code, resp.text[:400])
+        return "Baby, ajke server gula ektu ullu patha korche… abar pore try korbo? 🥺"
 
-    # If not OK, log body and return soft error text
-    if resp.status_code != 200:
-        text_preview = resp.text[:400]
-        print("❌ Gemini non-200 response:", text_preview)
-        return "Baby, ajke amar network ta ektu off lagche… abar ektu pore try korba? 🥺"
+    data = resp.json()
+    # job ID
+    job_id = data.get("id")
+    if not job_id:
+        print("❌ Horde no job id:", data)
+        return "Baby, amar kotha gulo network e hariye jacche… abar likho na? 🥺"
 
-    try:
-        data = resp.json()
-    except Exception as e:
-        print("❌ Gemini JSON parse error:", repr(e), "body:", resp.text[:400])
-        return "Baby, amar matha ektu hang hoye gelo… abar chesta korbo, thik ache? 🥺"
+    print(f"🟣 Horde job submitted: {job_id}")
 
-    # Small debug preview
-    print("🟣 Gemini raw:", json.dumps(data)[:400])
+    # Step 2: poll for result
+    status_url = HORDE_CHECK_URL + job_id
 
-    try:
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as e:
-        print("❌ Gemini shape error:", repr(e))
-        return "Baby, amar kotha gulo mix hoye jacche… tumi abar ektu likho na? 🥺"
+    for i in range(30):  # up to ~30 polls
+        try:
+            st = requests.get(status_url, headers=headers, timeout=20)
+        except Exception as e:
+            print("❌ Horde HTTP error (status):", repr(e))
+            break
+
+        if st.status_code != 200:
+            print("❌ Horde status non-200:", st.status_code, st.text[:400])
+            break
+
+        st_data = st.json()
+        # When done, "done" is True and "generations" has content
+        if st_data.get("done"):
+            gens = st_data.get("generations") or []
+            if gens:
+                text = gens[0].get("text", "").strip()
+                print("✅ Horde generation received.")
+                return text or "Baby, amar kotha gulo ektu confuse hoye gelo… abar likho? 🥺"
+            else:
+                print("❌ Horde generations empty:", st_data)
+                break
+
+        # Not done yet → wait a bit
+        asyncio.sleep(0.0)  # no-op for sync
+        import time
+        time.sleep(2)
+
+    # If still not returned:
+    print("❌ Horde generation timeout.")
+    return "Baby, onek deri hoye jacche… amar connection ektu slow mone hocche… abar try korbo? 🥺"
 
 
-async def gemini_reply(user_name: str, user_msg: str) -> str:
-    """Async wrapper to call Gemini in a thread."""
-    return await asyncio.to_thread(gemini_reply_sync, user_name, user_msg)
+async def horde_generate(prompt: str) -> str:
+    # run blocking HTTP logic in a separate thread
+    return await asyncio.to_thread(horde_generate_sync, prompt)
+
 
 # ------------ DISCORD EVENTS ------------
 
 @client.event
 async def on_ready():
-    print(f"✅ Suraiya (Gemini) online as {client.user} (ID: {client.user.id})")
+    print(f"✅ Suraiya (Horde) online as {client.user} (ID: {client.user.id})")
 
 @client.event
 async def on_message(message: discord.Message):
-    # ignore bots (including own)
+    # ignore other bots
     if message.author.bot:
         return
 
@@ -125,7 +183,7 @@ async def on_message(message: discord.Message):
 
     is_dm = isinstance(message.channel, discord.DMChannel)
 
-    # Channel restriction for server messages
+    # optional: limit to one channel in servers
     if not is_dm and ALLOWED_CHANNEL_ID:
         if message.channel.id != ALLOWED_CHANNEL_ID:
             return
@@ -133,20 +191,24 @@ async def on_message(message: discord.Message):
     user_name = message.author.display_name
     print(f"💬 EVENT from {user_name} in {message.channel}: {content!r}")
 
-    reply = await gemini_reply(user_name, content)
+    prompt = build_prompt(user_name, content)
 
-    if len(reply) > 1900:
-        reply = reply[:1900]
+    reply_text = await horde_generate(prompt)
+
+    # ensure not too long
+    if len(reply_text) > 1900:
+        reply_text = reply_text[:1900]
 
     try:
-        await message.channel.send(reply)
+        await message.channel.send(reply_text)
     except Exception as e:
         print("❌ Discord send error:", repr(e))
+
 
 # ------------ KEEP-ALIVE WEB SERVER ------------
 
 async def handle_root(request):
-    return web.Response(text="Suraiya (Gemini) is alive 💖")
+    return web.Response(text="Suraiya (KoboldAI Horde) is alive 💖")
 
 async def start_web():
     app = web.Application()
@@ -158,6 +220,7 @@ async def start_web():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     print(f"🌐 Web server running on port {PORT}")
+
 
 # ------------ MAIN ------------
 
